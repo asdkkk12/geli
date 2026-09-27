@@ -1,0 +1,16 @@
+[Unit]
+Description=Lab Docker Agent
+After=network-online.target docker.service
+[Service]
+User=lab-agent
+SupplementaryGroups=docker
+WorkingDirectory=/opt/lab-platform
+EnvironmentFile=/etc/lab-platform/agent.env
+ExecStart=/usr/bin/node apps/agent/dist/main.js
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+[Install]
+WantedBy=multi-user.target

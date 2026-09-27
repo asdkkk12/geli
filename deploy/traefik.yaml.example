@@ -1,0 +1,22 @@
+# Render placeholders outside the repository. No Docker socket required.
+entryPoints:
+  web:
+    address: ':80'
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ':443'
+providers:
+  http:
+    endpoint: http://127.0.0.1:3000/internal/routes
+    pollInterval: 5s
+    headers:
+      Authorization: 'Bearer REPLACE_GATEWAY_TOKEN'
+  file:
+    filename: /etc/lab-platform/gateway.yaml
+api:
+  dashboard: false
+accessLog: {}

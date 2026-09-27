@@ -1,0 +1,15 @@
+[Unit]
+Description=Lab container platform API
+After=network-online.target
+[Service]
+User=lab-platform
+WorkingDirectory=/opt/lab-platform
+EnvironmentFile=/etc/lab-platform/api.env
+ExecStart=/usr/bin/node apps/api/dist/main.js
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+[Install]
+WantedBy=multi-user.target

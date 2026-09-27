@@ -1,0 +1,19 @@
+http:
+  routers:
+    portal:
+      rule: Host(`portal.example.edu`)
+      entryPoints: [websecure]
+      service: portal
+      tls: {}
+  services:
+    portal:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:8088
+tls:
+  certificates:
+    - certFile: /etc/lab-platform/tls/fullchain.pem
+      keyFile: /etc/lab-platform/tls/privkey.pem
+  options:
+    default:
+      minVersion: VersionTLS12
