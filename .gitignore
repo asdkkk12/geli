@@ -6,5 +6,4 @@ dist/
 *.log
 .DS_Store
 .demo/
-/README.md
-/exampleProject/README.md
+*.md
