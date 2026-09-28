@@ -19,6 +19,7 @@ const startedContainers = new Set();
 let control, dockerHost, stopping = false;
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const id = crypto.randomBytes(32).toString('hex');
+const secretKey = crypto.createHash('sha256').update('geli-demo-secret:'+root).digest('hex');
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -153,6 +154,7 @@ async function start() {
     PUBLIC_ORIGIN: 'http://127.0.0.1:5173', APP_DOMAIN: 'apps.example.test', PORT: '3000', BIND_ADDRESS: '127.0.0.1',
     AGENT_PORT: '3100', AGENT_BIND_ADDRESS: '127.0.0.1', AGENT_TLS_CERT_FILE: '', AGENT_TLS_KEY_FILE: '',
     AGENT_SHARED_SECRET: id, AGENT_A_SECRET: id, GATEWAY_TOKEN: crypto.randomBytes(32).toString('hex'),
+    SECRET_ENCRYPTION_KEY: secretKey, BUILDKIT_HOST: process.env.BUILDKIT_HOST || '', BUILDCTL_BIN: process.env.BUILDCTL_BIN || 'buildctl',
     IMAGE_TEMPLATES_JSON: JSON.stringify({ 'lab-dev': imageName }),
     SERVERS_JSON: JSON.stringify([{ id: 'local-demo', url: 'http://127.0.0.1:3100', secretEnv: 'AGENT_A_SECRET', cpu: 4, memoryMb: 4096, diskGb: 40 }]),
     DOCKER_SOCKET: dockerHost.slice(7), APP_BIND_IP: '127.0.0.1', APP_UPSTREAM_HOST: '127.0.0.1',
@@ -170,7 +172,7 @@ async function start() {
   delete webEnv.BOOTSTRAP_ADMIN_PASSWORD;
   launch('web', runtime, ['node_modules/vite/bin/vite.js', '--config', 'apps/web/vite.config.ts', 'apps/web', '--host', '127.0.0.1', '--port', '5173', '--strictPort'], webEnv);
   await waitFor(async () => (await fetch('http://127.0.0.1:5173', { signal: AbortSignal.timeout(2000) })).ok, '网页');
-  console.log('\n演示启动成功：http://127.0.0.1:5173\n管理员：admin（首次使用演示默认密码，可用环境变量覆盖；已有账号沿用原密码）\n日志：.demo/logs/\n流程：创建普通用户 → 用户申请 → admin审批 → 用户进入终端。\nCtrl+C 或另一个终端 npm run demo:stop 可停止平台。\n注意：演示使用 tmpfs，工作目录不是持久化存储；应用域名网关未启动。');
+  console.log('\n演示启动成功：http://127.0.0.1:5173\n管理员：admin（首次使用演示默认密码，可用环境变量覆盖；已有账号沿用原密码）\n日志：.demo/logs/\n流程：用户可申请开发容器，或提交公开 GitHub 项目由 admin 审核后自动部署。\n自动构建要求 Agent 配置可用的 BUILDKIT_HOST；未配置时服务器会显示构建器不可用。\nCtrl+C 或另一个终端 npm run demo:stop 可停止平台。\n注意：演示使用 tmpfs，工作目录不是持久化存储；应用域名网关未启动。');
 }
 async function command() {
   const op = process.argv[2] || 'start';

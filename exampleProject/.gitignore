@@ -3,4 +3,4 @@ dist/
 .runtime/
 *.log
 .env*
-
+*.md

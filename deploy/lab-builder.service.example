@@ -1,0 +1,22 @@
+[Unit]
+Description=Rootless BuildKit for geli
+After=network-online.target
+
+[Service]
+User=lab-builder
+Group=lab-build
+Environment=XDG_RUNTIME_DIR=/run/geli-buildkit
+RuntimeDirectory=geli-buildkit
+RuntimeDirectoryMode=0770
+ExecStart=/usr/local/bin/buildkitd-rootless.sh --addr unix:///run/geli-buildkit/buildkitd.sock --group lab-build --oci-worker-gc=true
+Restart=on-failure
+MemoryMax=4G
+CPUQuota=200%
+TasksMax=512
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

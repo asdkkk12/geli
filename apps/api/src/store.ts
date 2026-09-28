@@ -27,6 +27,24 @@ export async function migrate() {
       CREATE TABLE IF NOT EXISTS audit (
         id BIGSERIAL PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL,
         resource TEXT NOT NULL, detail JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+      ALTER TABLE applications ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'DEVELOPMENT';
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS log TEXT;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS detail JSONB NOT NULL DEFAULT '{}';
+      CREATE TABLE IF NOT EXISTS image_templates (
+        id UUID PRIMARY KEY, application_id UUID UNIQUE NOT NULL REFERENCES applications(id),
+        owner_id UUID NOT NULL REFERENCES users(id), source_type TEXT NOT NULL DEFAULT 'GITHUB',
+        repository_url TEXT NOT NULL, source_ref TEXT NOT NULL, source_commit TEXT NOT NULL,
+        dockerfile_path TEXT NOT NULL, context_path TEXT NOT NULL, server_id TEXT,
+        image_ref TEXT, image_id TEXT, status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL',
+        error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+      ALTER TABLE image_templates ADD COLUMN IF NOT EXISTS retain_until TIMESTAMPTZ;
+      CREATE TABLE IF NOT EXISTS application_secrets (
+        application_id UUID NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+        name TEXT NOT NULL, ciphertext TEXT NOT NULL, iv TEXT NOT NULL, tag TEXT NOT NULL,
+        PRIMARY KEY(application_id,name));
+      UPDATE users SET role='ADMIN' WHERE role='APPROVER';
+      ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+      ALTER TABLE users ADD CONSTRAINT users_role_check CHECK(role IN ('USER','ADMIN'));
     `);
   });
 }

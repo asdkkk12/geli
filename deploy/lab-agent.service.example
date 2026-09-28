@@ -3,7 +3,7 @@ Description=Lab Docker Agent
 After=network-online.target docker.service
 [Service]
 User=lab-agent
-SupplementaryGroups=docker
+SupplementaryGroups=docker lab-build
 WorkingDirectory=/opt/lab-platform
 EnvironmentFile=/etc/lab-platform/agent.env
 ExecStart=/usr/bin/node apps/agent/dist/main.js

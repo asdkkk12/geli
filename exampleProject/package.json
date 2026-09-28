@@ -9,17 +9,13 @@
   "scripts": {
     "build": "tsc && vue-tsc --noEmit -p web/tsconfig.json && vite build",
     "start": "node dist/server/main.js",
-    "init-user": "node dist/scripts/init-user.js",
-    "test": "npm run build && node --test tests/*.test.mjs",
-    "deploy": "node scripts/deploy.cjs"
+    "test": "npm run build && node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "express": "^5.1.0",
-    "pg": "^8.16.0"
+    "express": "^5.1.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
-    "@types/pg": "^8.15.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.2",
     "vue": "^3.5.13",
