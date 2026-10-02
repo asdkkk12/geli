@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFile, spawn, ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createSchema, buildSchema, hostConfig, verifySignature } from './policy';
+import { createSchema, buildSchema, pullSchema, hostConfig, verifySignature } from './policy';
 const docker=new Docker({socketPath:process.env.DOCKER_SOCKET||'/var/run/docker.sock'});
 const secret=process.env.AGENT_SHARED_SECRET||'';
 if(secret.length<32)throw new Error('AGENT_SHARED_SECRET requires at least 32 characters');
@@ -27,16 +27,21 @@ if(process.env.NODE_ENV==='production' && volumeDriver==='local' && options.type
 const bind=process.env.APP_BIND_IP||'127.0.0.1';
 const appHost=process.env.APP_UPSTREAM_HOST||'127.0.0.1';
 if(!/^[a-zA-Z0-9.-]+$/.test(appHost))throw new Error('Invalid APP_UPSTREAM_HOST');
+const expiryTime=(value:unknown)=>value?new Date(value as string).getTime():Infinity;
 const seen=new Map<string,number>();
 const execFileAsync=promisify(execFile);
 type BuildState={status:'QUEUED'|'BUILDING'|'SUCCEEDED'|'FAILED',logs:string,error?:string,imageId?:string,imageRef?:string,process?:ChildProcess};
 const builds=new Map<string,BuildState>();
 let buildQueue:Promise<void>=Promise.resolve();
+type PullState={status:'QUEUED'|'PULLING'|'SUCCEEDED'|'FAILED',logs:string,error?:string,imageId?:string,imageRef?:string,digest?:string,cancel?:()=>void};
+const pulls=new Map<string,PullState>();
+let pullQueue:Promise<void>=Promise.resolve();
 const buildkitHost=process.env.BUILDKIT_HOST||'';
 const buildctl=process.env.BUILDCTL_BIN||'buildctl';
 const gitEnvironment=()=>Object.fromEntries(['PATH','HOME','TMPDIR','HTTP_PROXY','HTTPS_PROXY','NO_PROXY','http_proxy','https_proxy','no_proxy','SSL_CERT_FILE','SSL_CERT_DIR','GIT_SSL_CAINFO'].flatMap(k=>process.env[k]===undefined?[]:[[k,process.env[k]!]]));
 async function builderAvailable(){if(!buildkitHost)return false;try{await execFileAsync(buildctl,['--addr',buildkitHost,'debug','workers'],{timeout:3000,maxBuffer:1024*1024});return true;}catch{return false;}}
 const appendLog=(state:BuildState,value:string)=>{state.logs=(state.logs+value).slice(-1048576);};
+const appendPullLog=(state:PullState,value:string)=>{state.logs=(state.logs+value).slice(-1048576);};
 async function directorySize(root:string):Promise<number>{let total=0;for(const entry of await readdir(root,{withFileTypes:true})){if(entry.name==='.git')continue;const file=path.join(root,entry.name);if(entry.isDirectory())total+=await directorySize(file);else if(entry.isFile())total+=(await stat(file)).size;}return total;}
 async function runBuild(input:ReturnType<typeof buildSchema.parse>,state:BuildState) {
   state.status='BUILDING';let root='';
@@ -67,6 +72,26 @@ async function runBuild(input:ReturnType<typeof buildSchema.parse>,state:BuildSt
   } catch(e:any){state.status='FAILED';state.error=String(e.message||e);appendLog(state,'\n'+state.error+'\n');}
   finally{state.process=undefined;if(root)await rm(root,{recursive:true,force:true}).catch(()=>{});}
 }
+async function runPull(input:ReturnType<typeof pullSchema.parse>,state:PullState) {
+  state.status='PULLING';let timeout:NodeJS.Timeout|undefined;
+  try {
+    const digest=input.imageRef.slice(input.imageRef.lastIndexOf('@')+1);
+    const stream:any=await docker.pull(input.imageRef,{platform:'linux/amd64'} as any);
+    state.cancel=()=>stream.destroy(new Error('Pull cancelled'));
+    timeout=setTimeout(()=>stream.destroy(new Error('Image pull timed out')),10*60*1000);
+    await new Promise<void>((resolve,reject)=>docker.modem.followProgress(stream,(error:any)=>error?reject(error):resolve(),(event:any)=>appendPullLog(state,JSON.stringify(event)+'\n')));
+    clearTimeout(timeout);timeout=undefined;state.cancel=undefined;
+    const image=await docker.getImage(input.imageRef).inspect();
+    if(Number(image.Size)>5*1024*1024*1024)throw new Error('Image exceeds 5 GB');
+    const localRef=`geli/custom:${input.templateId}-${digest.slice(7,19)}`;
+    await docker.getImage(input.imageRef).tag({repo:'geli/custom',tag:`${input.templateId}-${digest.slice(7,19)}`});
+    const local=await docker.getImage(localRef).inspect();
+    if(local.Id!==image.Id)throw new Error('Pulled image registration mismatch');
+    state.status='SUCCEEDED';state.imageId=image.Id;state.imageRef=localRef;state.digest=digest;
+  } catch(e:any) {
+    state.status='FAILED';state.error=String(e.message||e);appendPullLog(state,'\n'+state.error+'\n');
+  } finally {if(timeout)clearTimeout(timeout);state.cancel=undefined;}
+}
 // Reject packets signed before this process started: no replay window after restart.
 const started=Date.now();
 function auth(req:any,body='') {
@@ -86,7 +111,7 @@ async function managed(id:string) {
 }
 async function state(id:string) {
   const {info}=await managed(id);
-  const expiry=new Date(info.Config.Labels['lab.expires']).getTime();
+  const expiry=expiryTime(info.Config.Labels['lab.expires']);
   const port=Number(info.Config.Labels['lab.port']);
   const mapping=info.NetworkSettings.Ports?.[port+'/tcp']?.[0];
   let healthy=info.State.Running;
@@ -105,13 +130,14 @@ async function create(input:unknown) {
   const b=createSchema.parse(input);
   if(b.kind==='DEVELOPMENT'&&!images[b.imageTemplate])throw Object.assign(new Error('Image not approved'),{status:400});
   if(!diskQuota)throw Object.assign(new Error('Quota-capable volume driver not configured'),{status:409});
-  if(new Date(b.expiresAt).getTime()<=Date.now())throw Object.assign(new Error('Expired application'),{status:409});
+  if(expiryTime(b.expiresAt)<=Date.now())throw Object.assign(new Error('Expired application'),{status:409});
   return serial(b.id,async()=>{
-    try {const existing=await managed(b.id);if(!existing.info.State.Running)await existing.c.start();return b.kind==='GITHUB'?await waitHealthy(b.id):await state(b.id);}catch(e:any){if(e.statusCode!==404)throw e;}
-    const runtime=b.kind==='GITHUB'?b.runtime:b;
+    try {const existing=await managed(b.id);if(!existing.info.State.Running)await existing.c.start();return b.kind!=='DEVELOPMENT'?await waitHealthy(b.id):await state(b.id);}catch(e:any){if(e.statusCode!==404)throw e;}
+    const runtime=b.kind!=='DEVELOPMENT'?b.runtime:b;
     let imageName:string;
     if(b.kind==='DEVELOPMENT') {imageName=images[b.imageTemplate];await docker.getImage(imageName).inspect();}
-    else {const image=await docker.getImage(b.imageId).inspect();if(image.Id!==b.imageId||image.Config.Labels?.['lab.template']!==b.templateId||image.Config.Labels?.['lab.application']!==b.id)throw Object.assign(new Error('Custom image is not approved for this deployment'),{status:400});imageName=image.Id;}
+    else if(b.kind==='GITHUB') {const image=await docker.getImage(b.imageId).inspect();if(image.Id!==b.imageId||image.Config.Labels?.['lab.template']!==b.templateId||image.Config.Labels?.['lab.application']!==b.id)throw Object.assign(new Error('Custom image is not approved for this deployment'),{status:400});imageName=image.Id;}
+    else {const image=await docker.getImage(b.imageRef).inspect();if(image.Id!==b.imageId||!b.imageRef.startsWith(`geli/custom:${b.templateId}-`))throw Object.assign(new Error('Pulled image is not approved for this deployment'),{status:400});imageName=b.imageRef;}
     const resource=name(b.id);
     try {await docker.getNetwork(resource).inspect();}
     catch(e:any){if(e.statusCode!==404)throw e;await docker.createNetwork({Name:resource,Driver:'bridge',Labels:{[label]:b.id},Options:{'com.docker.network.bridge.enable_icc':'false'}});}
@@ -125,18 +151,18 @@ async function create(input:unknown) {
     if(network.Labels?.[label]!==b.id)throw new Error('Network ownership mismatch');
     let c:Docker.Container;
     try {
-      const custom=b.kind==='GITHUB';
-      const github=b.kind==='GITHUB'?b:null;
+      const custom=b.kind!=='DEVELOPMENT';
+      const automated=b.kind!=='DEVELOPMENT'?b:null;
       const config:any={name:resource,Image:imageName,User:'1000:1000',
-        Env:github?['HOME=/home/developer','TERM=xterm-256color',`PORT=${github.runtime.internalPort}`,`PUBLIC_ORIGIN=${github.publicOrigin}`,'GELI_DATA_DIR=/data',...Object.entries(github.runtime.environment).map(([k,v])=>`${k}=${v}`),...Object.entries(github.secrets).map(([k,v])=>`${k}=${v}`)]:['HOME=/home/developer','TERM=xterm-256color'],
-        Labels:{[label]:b.id,'lab.expires':b.expiresAt,'lab.port':String(runtime.internalPort||0),...(github?{'lab.template':github.templateId,'lab.health':github.runtime.healthPath}: {})},
+        Env:automated?['HOME=/home/developer','TERM=xterm-256color',`PORT=${automated.runtime.internalPort}`,`PUBLIC_ORIGIN=${automated.publicOrigin}`,'GELI_DATA_DIR=/data',...Object.entries(automated.runtime.environment).map(([k,v])=>`${k}=${v}`),...Object.entries(automated.secrets).map(([k,v])=>`${k}=${v}`)]:['HOME=/home/developer','TERM=xterm-256color'],
+        Labels:{[label]:b.id,'lab.port':String(runtime.internalPort||0),...(b.expiresAt?{'lab.expires':b.expiresAt}:{}),...(automated?{'lab.template':automated.templateId,'lab.health':automated.runtime.healthPath}: {})},
         ExposedPorts:runtime.internalPort?{[runtime.internalPort+'/tcp']: {}}:{},
         HostConfig:hostConfig(runtime.cpu,runtime.memoryMb,resource,resource,runtime.internalPort,bind,custom?'/data':'/home/developer') as any};
-      if(github){if(github.runtime.command)config.Cmd=github.runtime.command;}else{config.WorkingDir='/home/developer';config.Cmd=['sleep','infinity'];}
+      if(automated){if(automated.runtime.command)config.Cmd=automated.runtime.command;}else{config.WorkingDir='/home/developer';config.Cmd=['sleep','infinity'];}
       c=await docker.createContainer(config);
     }catch(e:any){if(e.statusCode!==409)throw e;c=(await managed(b.id)).c;}
     await c.start().catch((e:any)=>{if(e.statusCode!==304)throw e;});
-    return b.kind==='GITHUB'?await waitHealthy(b.id):await state(b.id);
+    return b.kind!=='DEVELOPMENT'?await waitHealthy(b.id):await state(b.id);
   });
 }
 const terminals=new Map<string,Set<WebSocket>>();
@@ -146,7 +172,7 @@ async function action(id:string,op:string) {
     let item;
     try{item=await managed(id);}catch(e:any){if(op==='delete'&&e.statusCode===404)return {status:'DELETED'};throw e;}
     const {c,info}=item;
-    if(['start','restart'].includes(op)&&new Date(info.Config.Labels['lab.expires']).getTime()<=Date.now())throw Object.assign(new Error('Expired'),{status:409});
+    if(['start','restart'].includes(op)&&expiryTime(info.Config.Labels['lab.expires'])<=Date.now())throw Object.assign(new Error('Expired'),{status:409});
     if(['stop','restart','delete'].includes(op))closeTerminals(id);
     if(op==='delete') {
       if(info.State.Running)await c.stop({t:5});
@@ -182,13 +208,29 @@ class AgentController {
         if(req.method==='GET'&&!build[2]){res.json({status:state.status,imageId:state.imageId,imageRef:state.imageRef,error:state.error});return;}
         if(req.method==='DELETE'&&!build[2]){state.process?.kill('SIGKILL');state.status='FAILED';state.error='Build cancelled';res.json({status:state.status});return;}
       }
+      if(req.path==='/agent/pulls'&&req.method==='POST') {
+        const input=pullSchema.parse(req.body),existing=pulls.get(input.id);
+        if(existing&&existing.status!=='FAILED'){res.json({status:existing.status,imageId:existing.imageId,imageRef:existing.imageRef,digest:existing.digest,error:existing.error});return;}
+        const state:PullState={status:'QUEUED',logs:''};pulls.set(input.id,state);pullQueue=pullQueue.catch(()=>{}).then(()=>runPull(input,state));
+        res.status(202).json({status:'QUEUED'});return;
+      }
+      const pull=req.path.match(/^\/agent\/pulls\/([a-f0-9-]{36})(?:\/(logs))?$/);
+      if(pull) {
+        const state=pulls.get(pull[1]);if(!state){res.status(404).json({message:'Pull not found'});return;}
+        if(req.method==='GET'&&pull[2]==='logs'){res.json({logs:state.logs});return;}
+        if(req.method==='GET'&&!pull[2]){res.json({status:state.status,imageId:state.imageId,imageRef:state.imageRef,digest:state.digest,error:state.error});return;}
+        if(req.method==='DELETE'&&!pull[2]){state.cancel?.();state.status='FAILED';state.error='Pull cancelled';res.json({status:state.status});return;}
+      }
       if(req.path==='/agent/containers'&&req.method==='POST'){res.json(await create(req.body));return;}
       const image=req.path.match(/^\/agent\/images\/([a-f0-9-]{36})$/);
       if(image&&req.method==='DELETE') {
         const containers=await docker.listContainers({all:true,filters:JSON.stringify({label:[`lab.template=${image[1]}`]})});
         if(containers.length)throw Object.assign(new Error('Image is still referenced by a container'),{status:409});
         const list=await docker.listImages({filters:JSON.stringify({label:[`lab.template=${image[1]}`]})});
-        for(const item of list)await docker.getImage(item.Id).remove();res.json({status:'PURGED'});return;
+        for(const item of list)await docker.getImage(item.Id).remove();
+        const tagged=await docker.listImages();
+        for(const item of tagged)for(const ref of item.RepoTags||[])if(ref.startsWith(`geli/custom:${image[1]}-`))await docker.getImage(ref).remove();
+        res.json({status:'PURGED'});return;
       }
       const m=req.path.match(/^\/agent\/containers\/([a-f0-9-]{36})(?:\/(start|stop|restart|delete|logs))?$/);
       if(m) {
@@ -221,7 +263,7 @@ async function bootstrap() {
       auth(req);
       const match=req.url.match(/^\/agent\/containers\/([a-f0-9-]{36})\/terminal$/);if(!match)throw new Error('path');
       const id=match[1],{c,info}=await managed(id);
-      if(!info.State.Running||new Date(info.Config.Labels['lab.expires']).getTime()<=Date.now())throw new Error('Container unavailable');
+      if(!info.State.Running||expiryTime(info.Config.Labels['lab.expires'])<=Date.now())throw new Error('Container unavailable');
       wss.handleUpgrade(req,socket,head,async ws=>{
         let stream:any, timer:NodeJS.Timeout|undefined;
         const peers=terminals.get(id)||new Set<WebSocket>();peers.add(ws);terminals.set(id,peers);
@@ -231,7 +273,7 @@ async function bootstrap() {
           const exec=await c.exec({Cmd:['/bin/sh'],User:'1000:1000',AttachStdin:true,AttachStdout:true,AttachStderr:true,Tty:true,Env:['TERM=xterm-256color']});
           stream=await exec.start({hijack:true,stdin:true});
           if(ws.readyState!==WebSocket.OPEN){cleanup();return;}
-          timer=setTimeout(()=>ws.close(1008,'expired'),Math.min(3600000,new Date(info.Config.Labels['lab.expires']).getTime()-Date.now()));
+          timer=setTimeout(()=>ws.close(1008,'expired'),Math.min(3600000,expiryTime(info.Config.Labels['lab.expires'])-Date.now()));
           stream.on('data',(data:Buffer)=>{if(ws.bufferedAmount>1024*1024){ws.close(1009,'slow consumer');return;}if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'output',data:data.toString('base64')}));});
           stream.on('end',()=>ws.close());stream.on('error',()=>ws.close(1011,'exec failed'));
           ws.send(JSON.stringify({type:'ready'}));
@@ -252,7 +294,7 @@ async function bootstrap() {
   const timer=setInterval(async()=>{
     try {
       const list=await docker.listContainers({filters:JSON.stringify({label:[label]})});
-      for(const c of list)if(new Date(c.Labels['lab.expires']).getTime()<=Date.now())await action(c.Labels[label],'stop');
+      for(const c of list)if(expiryTime(c.Labels['lab.expires'])<=Date.now())await action(c.Labels[label],'stop');
     }catch(e:any){console.error(e.message);}
   },10000);
   await app.listen(Number(process.env.AGENT_PORT||3100),process.env.AGENT_BIND_ADDRESS||'127.0.0.1');

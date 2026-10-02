@@ -172,7 +172,7 @@ async function start() {
   delete webEnv.BOOTSTRAP_ADMIN_PASSWORD;
   launch('web', runtime, ['node_modules/vite/bin/vite.js', '--config', 'apps/web/vite.config.ts', 'apps/web', '--host', '127.0.0.1', '--port', '5173', '--strictPort'], webEnv);
   await waitFor(async () => (await fetch('http://127.0.0.1:5173', { signal: AbortSignal.timeout(2000) })).ok, '网页');
-  console.log('\n演示启动成功：http://127.0.0.1:5173\n管理员：admin（首次使用演示默认密码，可用环境变量覆盖；已有账号沿用原密码）\n日志：.demo/logs/\n流程：用户可申请开发容器，或提交公开 GitHub 项目由 admin 审核后自动部署。\n自动构建要求 Agent 配置可用的 BUILDKIT_HOST；未配置时服务器会显示构建器不可用。\nCtrl+C 或另一个终端 npm run demo:stop 可停止平台。\n注意：演示使用 tmpfs，工作目录不是持久化存储；应用域名网关未启动。');
+  console.log('\n演示启动成功：http://127.0.0.1:5173\n管理员：admin（首次使用演示默认密码，可用环境变量覆盖；已有账号沿用原密码）\n日志：.demo/logs/\n流程：用户可申请开发容器，也可提交公开 GitHub 源码或公开 GHCR 镜像，由 admin 审核后自动部署。\n源码构建要求 Agent 配置可用的 BUILDKIT_HOST；GHCR 镜像部署不依赖 BuildKit。\nCtrl+C 或另一个终端 npm run demo:stop 可停止平台。\n注意：演示使用 tmpfs，工作目录不是持久化存储；应用域名网关未启动。');
 }
 async function command() {
   const op = process.argv[2] || 'start';

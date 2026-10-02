@@ -15,7 +15,7 @@ const suffix=Date.now().toString(36);
 const env={...process.env,NODE_ENV:'test',DATABASE_URL:process.env.TEST_DATABASE_URL||'postgresql://postgres@127.0.0.1:55432/geli_test',REDIS_URL:'redis://127.0.0.1:56379',PUBLIC_ORIGIN:'http://127.0.0.1:5173',APP_DOMAIN:'apps.example.test',PORT:'3300',AGENT_PORT:'3310',AGENT_SHARED_SECRET:secret,TEST_AGENT_SECRET:secret,GATEWAY_TOKEN:gateway,SECRET_ENCRYPTION_KEY:secret,BOOTSTRAP_ADMIN_USERNAME:'admin-'+suffix,BOOTSTRAP_ADMIN_PASSWORD:password,IMAGE_TEMPLATES_JSON:JSON.stringify({test:'busybox:latest'}),SERVERS_JSON:JSON.stringify([{id:'test-server',url:'http://127.0.0.1:3310',secretEnv:'TEST_AGENT_SECRET',cpu:16,memoryMb:16384,diskGb:100}]),DOCKER_SOCKET:process.env.TEST_DOCKER_SOCKET||(fs.existsSync('/var/run/docker.sock')?'/var/run/docker.sock':path.join(home,'.docker/run/docker.sock')),VOLUME_DRIVER:'local',VOLUME_OPTIONS_JSON:JSON.stringify({type:'tmpfs',device:'tmpfs',o:'size={sizeGiB}g,uid=1000,gid=1000,mode=0700'})};
 const pool=new Pool({connectionString:env.DATABASE_URL});
 const docker=new Docker({socketPath:env.DOCKER_SOCKET});
-let api,agent,appId,gatewayContainer,logs='';
+let api,agent,appId,imageAppId,gatewayContainer,logs='';
 function start(service){const p=spawn(process.execPath,[`apps/${service}/dist/main.js`],{cwd:root,env,stdio:['ignore','pipe','pipe']});p.stdout.on('data',b=>logs+=b);p.stderr.on('data',b=>logs+=b);return p;}
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 async function wait(fn,timeout=45000){const end=Date.now()+timeout;while(Date.now()<end){try{const v=await fn();if(v)return v;}catch{}await delay(300);}throw new Error('Timed out\n'+logs.slice(-3000));}
@@ -33,7 +33,7 @@ async function main(){
  await call('/api/users',a.token,'POST',{username:u2,password,role:'USER'});
  const user=await call('/api/auth/login',null,'POST',{username:u1,password});
  const other=await call('/api/auth/login',null,'POST',{username:u2,password});
- const spec={containerName:'integration-dev',purpose:'integration testing',imageTemplate:'test',cpu:1,memoryMb:256,diskGb:1,runtimeHours:1,internalPort:8080};
+ const spec={containerName:'integration-dev',purpose:'integration testing',imageTemplate:'test',cpu:1,memoryMb:256,diskGb:1,internalPort:8080};
  await call('/api/container-applications',user.token,'POST',{...spec,privileged:true},400);
  const app=await call('/api/container-applications',user.token,'POST',spec,201);appId=app.id;
  await call('/api/approvals/'+app.id+'/approve',user.token,'POST',{},403);
@@ -51,7 +51,8 @@ async function main(){
  await new Promise((resolve,reject)=>{const t=setTimeout(()=>reject(new Error('Terminal ticket replay was not closed')),5000);replay.on('open',()=>replay.send(JSON.stringify({ticket})));replay.on('close',code=>{clearTimeout(t);try{assert.equal(code,1008);resolve();}catch(e){reject(e);}});replay.on('error',reject);});
  const state=(await call('/api/containers',user.token)).find(c=>c.id===app.id);
  await wait(async()=>{const r=await fetch(state.upstream.replace('host.docker.internal','127.0.0.1'));return(await r.text()).includes('web-ok');});
- const info=await docker.getContainer('lab-'+app.id).inspect();assert.equal(info.Config.User,'1000:1000');assert.equal(info.HostConfig.Privileged,false);assert.equal(info.HostConfig.ReadonlyRootfs,true);assert.deepEqual(info.HostConfig.CapDrop,['ALL']);
+ const info=await docker.getContainer('lab-'+app.id).inspect();assert.equal(info.Config.User,'1000:1000');assert.equal(info.HostConfig.Privileged,false);assert.equal(info.HostConfig.ReadonlyRootfs,true);assert.deepEqual(info.HostConfig.CapDrop,['ALL']);assert.equal(info.Config.Labels['lab.expires'],undefined);
+ assert.equal((await pool.query('SELECT expires_at FROM containers WHERE id=$1',[app.id])).rows[0].expires_at,null);
  const routes=await(await fetch('http://127.0.0.1:3300/internal/routes',{headers:{authorization:'Bearer '+gateway}})).json();assert.ok(routes.http.routers['c-'+app.id]);
  if(process.env.TEST_GATEWAY==='1') {
    gatewayContainer=await docker.createContainer({name:'geli-test-traefik-'+suffix,Image:'traefik:v3.6',Cmd:['--entrypoints.websecure.address=:443','--providers.http.endpoint=http://host.docker.internal:3300/internal/routes','--providers.http.pollInterval=1s','--providers.http.headers.Authorization=Bearer '+gateway],ExposedPorts:{'443/tcp':{}},HostConfig:{PortBindings:{'443/tcp':[{HostIp:'127.0.0.1',HostPort:'58443'}]}}});
@@ -62,6 +63,18 @@ async function main(){
  }
  const time=String(Date.now()),nonce=randomUUID(),p='/agent/resources';const sig=createHmac('sha256',secret).update(['GET',p,time,nonce,''].join('\n')).digest('hex');const headers={'x-time':time,'x-nonce':nonce,'x-signature':sig};
  assert.equal((await fetch('http://127.0.0.1:3310'+p,{headers})).status,200);assert.equal((await fetch('http://127.0.0.1:3310'+p,{headers})).status,401);
+ if(process.env.TEST_GHCR==='1') {
+   const imageSpec={containerName:'integration-image',purpose:'GHCR image deployment',source:{type:'ghcr',imageRef:'ghcr.io/asdkkk12/test1:latest'},runtime:{cpu:1,memoryMb:512,diskGb:1,runtimeHours:1,internalPort:8080,command:null,environment:{NODE_ENV:'production',APP_USERNAME:'student'},secrets:{APP_PASSWORD:'Student-demo-2026'},healthPath:'/health'}};
+   const deployment=await call('/api/deployments',user.token,'POST',imageSpec,201);imageAppId=deployment.id;assert.match(deployment.digest,/^sha256:[a-f0-9]{64}$/);
+   const record=(await call('/api/deployments',user.token)).find(d=>d.id===deployment.id);assert.equal(record.source.digest,deployment.digest);assert.equal(record.source.resolvedImageRef,`ghcr.io/asdkkk12/test1@${deployment.digest}`);
+   await call('/api/deployments/'+deployment.id+'/approve',a.token,'POST',{},202);
+   const running=await wait(async()=>{const list=await call('/api/containers',user.token);return list.find(c=>c.id===deployment.id&&c.status==='RUNNING');},180000);
+   const health=await fetch(running.upstream.replace('host.docker.internal','127.0.0.1')+'/health');assert.equal(health.status,200);
+   const deploymentInfo=await docker.getContainer('lab-'+deployment.id).inspect();assert.equal(deploymentInfo.Config.User,'1000:1000');assert.equal(deploymentInfo.Config.Image.startsWith('geli/custom:'),true);
+   await call('/api/containers/'+deployment.id+'/stop',user.token,'POST',{},202);await wait(async()=>{const list=await call('/api/containers',user.token);return list.find(c=>c.id===deployment.id&&c.status==='STOPPED');});
+   await call('/api/containers/'+deployment.id+'/start',user.token,'POST',{},202);await wait(async()=>{const list=await call('/api/containers',user.token);return list.find(c=>c.id===deployment.id&&c.status==='RUNNING');},90000);
+   console.log('PASS: public GHCR tag is pinned, pulled, isolated, health-checked and restarted.');
+ }
  await stop(api);api=start('api');await wait(async()=>{const r=await fetch('http://127.0.0.1:3300/health');return r.ok;});
  assert.ok((await call('/api/containers',user.token)).some(c=>c.id===app.id));
  await call('/api/containers/'+app.id+'/stop',user.token,'POST',{},202);
@@ -75,5 +88,6 @@ main().catch(e=>{console.error(e);console.error(logs.slice(-5000));process.exitC
  await stop(api);await stop(agent);
  if(gatewayContainer)await gatewayContainer.stop({t:1}).catch(()=>{});
  if(appId)await docker.getContainer('lab-'+appId).stop({t:1}).catch(()=>{});
+ if(imageAppId)await docker.getContainer('lab-'+imageAppId).stop({t:1}).catch(()=>{});
  await pool.end();
 });

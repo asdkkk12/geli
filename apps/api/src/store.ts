@@ -33,11 +33,19 @@ export async function migrate() {
       CREATE TABLE IF NOT EXISTS image_templates (
         id UUID PRIMARY KEY, application_id UUID UNIQUE NOT NULL REFERENCES applications(id),
         owner_id UUID NOT NULL REFERENCES users(id), source_type TEXT NOT NULL DEFAULT 'GITHUB',
-        repository_url TEXT NOT NULL, source_ref TEXT NOT NULL, source_commit TEXT NOT NULL,
-        dockerfile_path TEXT NOT NULL, context_path TEXT NOT NULL, server_id TEXT,
+        repository_url TEXT, source_ref TEXT, source_commit TEXT,
+        dockerfile_path TEXT, context_path TEXT, source_image_ref TEXT, source_digest TEXT, server_id TEXT,
         image_ref TEXT, image_id TEXT, status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL',
         error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
       ALTER TABLE image_templates ADD COLUMN IF NOT EXISTS retain_until TIMESTAMPTZ;
+      ALTER TABLE image_templates ADD COLUMN IF NOT EXISTS source_image_ref TEXT;
+      ALTER TABLE image_templates ADD COLUMN IF NOT EXISTS source_digest TEXT;
+      ALTER TABLE image_templates ALTER COLUMN repository_url DROP NOT NULL;
+      ALTER TABLE image_templates ALTER COLUMN source_ref DROP NOT NULL;
+      ALTER TABLE image_templates ALTER COLUMN source_commit DROP NOT NULL;
+      ALTER TABLE image_templates ALTER COLUMN dockerfile_path DROP NOT NULL;
+      ALTER TABLE image_templates ALTER COLUMN context_path DROP NOT NULL;
+      ALTER TABLE containers ALTER COLUMN expires_at DROP NOT NULL;
       CREATE TABLE IF NOT EXISTS application_secrets (
         application_id UUID NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
         name TEXT NOT NULL, ciphertext TEXT NOT NULL, iv TEXT NOT NULL, tag TEXT NOT NULL,

@@ -1,7 +1,7 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const {createHmac,randomUUID}=require('node:crypto');
-const {createSchema,buildSchema,hostConfig,verifySignature}=require('../dist/policy');
+const {createSchema,buildSchema,pullSchema,hostConfig,verifySignature}=require('../dist/policy');
 test('signature binds body, path, method and freshness',()=>{
   const secret='x'.repeat(32),time=String(Date.now()),nonce=randomUUID(),body='{}',path='/agent/containers';
   const sig=createHmac('sha256',secret).update(['POST',path,time,nonce,body].join('\n')).digest('hex');
@@ -15,11 +15,17 @@ test('custom image requests require an approved template identity',()=>{
   assert.equal(createSchema.safeParse({id,kind:'GITHUB',containerName:'web-app',purpose:'test app',templateId,imageId:'sha256:'+'a'.repeat(64),publicOrigin:'https://app.test',runtime,secrets:{DATABASE_URL:'secret'},expiresAt:new Date(Date.now()+3600000).toISOString()}).success,true);
   assert.equal(buildSchema.safeParse({id,templateId,repositoryUrl:'https://github.com/org/repo.git',commit:'a'.repeat(40),dockerfilePath:'Dockerfile',contextPath:'.'}).success,true);
   assert.equal(buildSchema.safeParse({id,templateId,repositoryUrl:'https://example.com/repo.git',commit:'a'.repeat(40),dockerfilePath:'../Dockerfile',contextPath:'.'}).success,false);
+  const digest='sha256:'+'b'.repeat(64),imageRef=`ghcr.io/asdkkk12/test1@${digest}`;
+  assert.equal(pullSchema.safeParse({id,templateId,imageRef}).success,true);
+  assert.equal(pullSchema.safeParse({id,templateId,imageRef:'ghcr.io/asdkkk12/test1:latest'}).success,false);
+  assert.equal(createSchema.safeParse({id,kind:'GHCR',containerName:'web-app',purpose:'test app',templateId,imageId:'sha256:'+'a'.repeat(64),imageRef:`geli/custom:${templateId}-${'b'.repeat(12)}`,publicOrigin:'https://app.test',runtime,secrets:{DATABASE_URL:'secret'},expiresAt:new Date(Date.now()+3600000).toISOString()}).success,true);
+  assert.equal(createSchema.safeParse({id,kind:'GHCR',containerName:'web-app',purpose:'test app',templateId,imageId:'sha256:'+'a'.repeat(64),imageRef:`geli/custom:${templateId}-${'b'.repeat(12)}`,publicOrigin:'https://app.test',runtime:{...runtime,runtimeHours:null},secrets:{DATABASE_URL:'secret'},expiresAt:null}).success,true);
   assert.equal(hostConfig(1,512,'net','vol',8080,'127.0.0.1','/data').Mounts[0].Target,'/data');
 });
 test('agent blocks arbitrary engine parameters',()=>{
   const valid={id:randomUUID(),containerName:'test-dev',purpose:'testing',imageTemplate:'node',cpu:1,memoryMb:512,diskGb:1,runtimeHours:1,expiresAt:new Date(Date.now()+3600000).toISOString()};
   assert.equal(createSchema.safeParse(valid).success,true);
+  assert.equal(createSchema.safeParse({...valid,runtimeHours:null,expiresAt:null}).success,true);
   for(const key of ['HostConfig','privileged','Mounts','Cmd','User','hostPort','hostPath'])assert.equal(createSchema.safeParse({...valid,[key]:{}}).success,false);
 });
 test('runtime isolation fixed independently of user input',()=>{

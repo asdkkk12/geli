@@ -7,14 +7,17 @@ export const specSchema = z.object({
   containerName: z.string().regex(/^[a-z][a-z0-9-]{1,39}$/), purpose: z.string().min(3).max(1000),
   imageTemplate: z.string().min(1).max(80), cpu: z.number().int().min(1).max(16),
   memoryMb: z.number().int().min(256).max(65536), diskGb: z.number().int().min(1).max(2000),
-  runtimeHours: z.number().int().min(1).max(720), internalPort: z.number().int().min(1024).max(65535).optional()
+  runtimeHours: z.number().int().min(1).max(720).nullable().default(null), internalPort: z.number().int().min(1024).max(65535).optional()
 }).strict();
 const relativePath=z.string().min(1).max(240).refine(v=>!v.startsWith('/')&&!v.split('/').includes('..'),'invalid path');
 const envName=z.string().regex(/^[A-Z_][A-Z0-9_]{0,63}$/).refine(v=>!['PORT','PUBLIC_ORIGIN','HOME','PATH'].includes(v)&&!v.startsWith('GELI_'),'reserved environment name');
 export const deploymentSchema=z.object({
   containerName:z.string().regex(/^[a-z][a-z0-9-]{1,39}$/),purpose:z.string().min(3).max(1000),
-  source:z.object({type:z.literal('github'),repositoryUrl:z.string().url().max(300),gitRef:z.string().min(1).max(120).default('HEAD'),dockerfilePath:relativePath.default('Dockerfile'),contextPath:relativePath.default('.')}).strict(),
-  runtime:z.object({cpu:z.number().int().min(1).max(16),memoryMb:z.number().int().min(256).max(65536),diskGb:z.number().int().min(1).max(2000),runtimeHours:z.number().int().min(1).max(720),internalPort:z.number().int().min(1024).max(65535),command:z.array(z.string().max(1000)).max(32).nullable().default(null),environment:z.record(envName,z.string().max(4000)).default({}),secrets:z.record(envName,z.string().min(1).max(16000)).default({}),healthPath:z.string().regex(/^\/(?!\/)[^\s?#]{0,255}$/).default('/health')}).strict()
+  source:z.discriminatedUnion('type',[
+    z.object({type:z.literal('github'),repositoryUrl:z.string().url().max(300),gitRef:z.string().min(1).max(120).default('HEAD'),dockerfilePath:relativePath.default('Dockerfile'),contextPath:relativePath.default('.')}).strict(),
+    z.object({type:z.literal('ghcr'),imageRef:z.string().min(1).max(400)}).strict()
+  ]),
+  runtime:z.object({cpu:z.number().int().min(1).max(16),memoryMb:z.number().int().min(256).max(65536),diskGb:z.number().int().min(1).max(2000),runtimeHours:z.number().int().min(1).max(720).nullable().default(null),internalPort:z.number().int().min(1024).max(65535),command:z.array(z.string().max(1000)).max(32).nullable().default(null),environment:z.record(envName,z.string().max(4000)).default({}),secrets:z.record(envName,z.string().min(1).max(16000)).default({}),healthPath:z.string().regex(/^\/(?!\/)[^\s?#]{0,255}$/).default('/health')}).strict()
 }).strict();
 export function githubRepository(value:string) {
   const url=new URL(value);
@@ -22,6 +25,14 @@ export function githubRepository(value:string) {
   const match=url.pathname.match(/^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/);
   if(!match)throw new HttpException('GitHub 仓库地址不合法',400);
   return `https://github.com/${match[1]}/${match[2]}.git`;
+}
+const ghcrPath='[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+';
+export function ghcrImageReference(value:string) {
+  const digest=value.match(new RegExp(`^(ghcr\\.io/${ghcrPath})@(sha256:[a-f0-9]{64})$`));
+  if(digest)return {repository:digest[1],reference:digest[2],requestedRef:value,digest:digest[2]};
+  const tag=value.match(new RegExp(`^(ghcr\\.io/${ghcrPath}):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$`));
+  if(tag)return {repository:tag[1],reference:tag[2],requestedRef:value};
+  throw new HttpException('仅支持带 tag 或 sha256 digest 的公开 ghcr.io 镜像',400);
 }
 function encryptionKey() {
   const raw=process.env.SECRET_ENCRYPTION_KEY||'';
