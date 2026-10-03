@@ -12,6 +12,11 @@
    [{"id":"lab-server-01","url":"https://agent-01.example.edu:3100","secretEnv":"AGENT_01_SECRET","cpu":56,"memoryMb":114688,"diskGb":3277}]
    Agent 地址、密钥变量名和 TLS 证书路径必须替换为真实管理网配置，不要提交密钥。
 
+内网 HTTP Docker 模式
+
+- 仅限受控私网可设置 `INTERNAL_HTTP_ONLY=true`。此模式允许 `PUBLIC_ORIGIN` 使用 RFC1918 地址的 HTTP URL，并允许 API 调用 `http://127.0.0.1:3100` 的本机 Agent；公网部署仍必须使用 HTTPS。
+- 设置 `ENABLE_APP_ROUTES=false` 时，Portal 不显示申请人容器的应用访问链接，`/internal/routes` 返回空配置。完整操作步骤见 `deploy/internal-http-deployment.txt`。
+
 权限、配额迁移与验收
 
 - 申请人仅能启动、停止自己的容器，仍可进入终端和查看日志。审批员与管理员在“容器管理”页可启动、停止、重启、删除所有容器；删除仅删除容器和网络，保留数据 Volume。

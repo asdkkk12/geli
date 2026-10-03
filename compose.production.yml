@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: geli
+      POSTGRES_USER: geli
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server","--appendonly","yes","--requirepass","${REDIS_PASSWORD:?set REDIS_PASSWORD}"]
+    ports: ["127.0.0.1:6379:6379"]
+    volumes: [redis-data:/data]
+
+  api:
+    image: ${API_IMAGE:?set API_IMAGE}
+    network_mode: host
+    restart: unless-stopped
+    depends_on: [postgres,redis]
+    environment:
+      NODE_ENV: production
+      INTERNAL_HTTP_ONLY: "true"
+      ENABLE_APP_ROUTES: "false"
+      PORT: "3000"
+      BIND_ADDRESS: 127.0.0.1
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}
+      APP_DOMAIN: apps.invalid
+      DATABASE_URL: postgresql://geli:${POSTGRES_PASSWORD}@127.0.0.1:5432/geli
+      REDIS_URL: redis://:${REDIS_PASSWORD}@127.0.0.1:6379
+      AGENT_01_SECRET: ${AGENT_01_SECRET:?set AGENT_01_SECRET}
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:?set GATEWAY_TOKEN}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?set BOOTSTRAP_ADMIN_PASSWORD}
+      IMAGE_TEMPLATES_JSON: '{"lab-dev":"${WORKSPACE_IMAGE:?set WORKSPACE_IMAGE}"}'
+      SERVERS_JSON: '[{"id":"lab-server-01","url":"http://127.0.0.1:3100","secretEnv":"AGENT_01_SECRET","cpu":56,"memoryMb":114688,"diskGb":3277}]'
+
+  agent:
+    image: ${AGENT_IMAGE:?set AGENT_IMAGE}
+    network_mode: host
+    pid: host
+    restart: unless-stopped
+    depends_on: [postgres,redis]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - /srv/lab-docker:/srv/lab-docker:ro
+      - /run/geli-quota-helper.sock:/run/geli-quota-helper.sock
+    environment:
+      NODE_ENV: production
+      INTERNAL_HTTP_ONLY: "true"
+      AGENT_PORT: "3100"
+      AGENT_BIND_ADDRESS: 127.0.0.1
+      AGENT_SHARED_SECRET: ${AGENT_01_SECRET:?set AGENT_01_SECRET}
+      DOCKER_SOCKET: /var/run/docker.sock
+      HOST_PROC_ROOT: /host/proc
+      APP_BIND_IP: 127.0.0.1
+      APP_UPSTREAM_HOST: 127.0.0.1
+      IMAGE_TEMPLATES_JSON: '{"lab-dev":"${WORKSPACE_IMAGE:?set WORKSPACE_IMAGE}"}'
+      VOLUME_DRIVER: local
+      VOLUME_OPTIONS_JSON: '{}'
+      QUOTA_HELPER_SOCKET: /run/geli-quota-helper.sock
+      QUOTA_VOLUME_ROOT: /srv/lab-docker/volumes
+
+  web:
+    image: ${WEB_IMAGE:?set WEB_IMAGE}
+    network_mode: host
+    restart: unless-stopped
+    depends_on: [api]
+
+volumes:
+  postgres-data:
+  redis-data:

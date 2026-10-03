@@ -60,14 +60,16 @@ export class ResourceMonitor {
   private running=false;
   private timer?:ReturnType<typeof setInterval>;
   snapshot:{sampledAt:string|null;cpu:Reading<{cores:number;usedPercent:number|null;idlePercent:number|null}>;memory:Reading<ReturnType<typeof memoryUsage>>;disks:Awaited<ReturnType<typeof collectDisks>>}={sampledAt:null,cpu:{value:null,error:null},memory:{value:null,error:null},disks:[]};
-  constructor(private readonly paths:()=>string[]) {}
+  constructor(private readonly paths:()=>string[],private readonly procRoot='/proc') {
+    if(!procRoot.startsWith('/')||procRoot.includes('\0'))throw new Error('HOST_PROC_ROOT must be an absolute path');
+  }
   async sample() {
     if(this.running)return;
     this.running=true;
     try {
       const [cpu,memory,disks]=await Promise.all([
-        reading(async()=>{const current=cpuCounters(await readFile('/proc/stat','utf8'));const usedPercent=cpuPercent(this.previous,current);this.previous=current;return {cores:cpus().length,usedPercent,idlePercent:usedPercent===null?null:100-usedPercent};}),
-        reading(async()=>memoryUsage(await readFile('/proc/meminfo','utf8'))),
+        reading(async()=>{const current=cpuCounters(await readFile(this.procRoot+'/stat','utf8'));const usedPercent=cpuPercent(this.previous,current);this.previous=current;return {cores:cpus().length,usedPercent,idlePercent:usedPercent===null?null:100-usedPercent};}),
+        reading(async()=>memoryUsage(await readFile(this.procRoot+'/meminfo','utf8'))),
         collectDisks(this.paths())
       ]);
       this.snapshot={sampledAt:new Date().toISOString(),cpu,memory,disks};

@@ -1,0 +1,31 @@
+内网 HTTP Docker 部署
+
+适用范围
+
+本方案仅用于受控实验室内网：Portal 通过 http://10.134.48.163 访问，API 与 Agent 只绑定本机回环地址。容器应用动态域名路由在此模式关闭，申请人通过 Portal 终端和日志工作。不要将 INTERNAL_HTTP_ONLY=true 用于公网地址。
+
+镜像
+
+GitHub Container Registry 发布四个自建镜像：geli-api、geli-web、geli-agent、geli-workspace。Compose 长期运行 PostgreSQL、Redis、API、Agent、Web；workspace 由 Agent 按审批按需创建。
+
+服务器准备
+
+1. 检查发行版、Docker、磁盘和挂载：lsblk -f、findmnt、docker version、docker compose version。确认 U.2 设备后才允许后续格式化。
+2. 将确认的 U.2 分区格式化为 XFS，并以 UUID 加入 /etc/fstab：UUID=<uuid> /srv/lab-docker xfs defaults,prjquota 0 0。挂载后执行 xfs_quota -x -c state /srv/lab-docker，Project quota state 必须为 ON。
+3. 按 deploy/docker-daemon.u2-data-root.json.example 将 Docker data-root 迁移至 /srv/lab-docker；停止 Docker、备份原数据、切换配置后重启 Docker 并确认 docker info 的 Docker Root Dir。
+4. 安装 xfsprogs，安装 geli-quota-helper.cjs 和 geli-quota-helper.service.example；助手必须以 root 运行，Socket 组为 lab-agent。
+5. 防火墙仅允许实验室网段访问 TCP 80。PostgreSQL、Redis、API、Agent 与 Docker Socket 不得对外监听。
+
+拉取和启动
+
+1. 使用只具备 read:packages 的 GitHub Package Token 登录 ghcr.io。
+2. 创建 /opt/geli，复制 compose.production.yml、deploy/production.env.example 和配额助手工件；将示例环境文件保存为 /opt/geli/.env.production，填入仅在服务器保存的随机密码和 Token，并设置 chmod 600。
+3. 在 /opt/geli 执行：docker compose --env-file .env.production -f compose.production.yml pull；随后执行 docker compose --env-file .env.production -f compose.production.yml up -d。
+4. 使用 docker compose --env-file .env.production -f compose.production.yml ps、curl -f http://127.0.0.1:3000/health 和 curl -I http://10.134.48.163 验证服务。
+
+验收
+
+- 管理端显示真实 CPU、内存、Docker 磁盘已用/总量。
+- 创建 1 GiB 容器后，向 /home/developer 写入超过 1 GiB 的数据失败。
+- 申请人只能启动、停止、终端和日志；审批员和管理员可在容器管理页执行完整生命周期操作。
+- 对应应用访问链接在此部署模式不显示。

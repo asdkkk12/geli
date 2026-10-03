@@ -1,0 +1,10 @@
+.git
+.demo
+node_modules
+dist
+apps/*/dist
+.env
+.env.*
+exampleProject
+docs
+*.log

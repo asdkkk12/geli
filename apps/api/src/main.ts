@@ -18,8 +18,12 @@ const serverMonitor=new ServerMonitor(servers,{get:key=>redis.get(key),set:(key,
 const queue = new Queue('container-operations', {connection:redis as any});
 const origin = process.env.PUBLIC_ORIGIN!;
 const domain = process.env.APP_DOMAIN!;
+const internalHttp=process.env.INTERNAL_HTTP_ONLY==='true';
+const appRoutes=process.env.ENABLE_APP_ROUTES!=='false';
+function privateHttp(value:string) { try {const url=new URL(value),host=url.hostname;return url.protocol==='http:'&&(host==='localhost'||host==='127.0.0.1'||host==='::1'||/^10\./.test(host)||/^192\.168\./.test(host)||/^172\.(1[6-9]|2\d|3[01])\./.test(host));} catch{return false;} }
 if (!origin || !/^https?:\/\//.test(origin) || !/^[a-z0-9.-]+$/.test(domain || '')) throw new Error('PUBLIC_ORIGIN and APP_DOMAIN required');
-if (process.env.NODE_ENV==='production' && !origin.startsWith('https://')) throw new Error('Production requires HTTPS');
+if (process.env.NODE_ENV==='production' && !origin.startsWith('https://') && !(internalHttp&&privateHttp(origin))) throw new Error('Production requires HTTPS');
+if (internalHttp&&!privateHttp(origin)) throw new Error('Internal HTTP requires a private or loopback PUBLIC_ORIGIN');
 const templates = JSON.parse(process.env.IMAGE_TEMPLATES_JSON || '{}') as Record<string,string>;
 if (!Object.keys(templates).length) throw new Error('IMAGE_TEMPLATES_JSON required');
 type User = {id:string;username:string;role:string};
@@ -53,7 +57,7 @@ async function operation(user:User,id:string,action:string,managed=false) {
   return {queued:true};
 }
 const serialize=(r:any)=>({...r,...r.spec, userId:r.owner_id, ownerId:r.owner_id,name:r.spec.containerName,serverId:r.server_id,expiresAt:r.expires_at,
-  applicationUrl:r.spec.internalPort ? 'https://c-'+r.id+'.'+domain : null});
+  applicationUrl:appRoutes&&r.spec.internalPort ? 'https://c-'+r.id+'.'+domain : null});
 @Controller()
 class ControllerImpl {
   @All('{*path}')
@@ -64,6 +68,7 @@ class ControllerImpl {
       if(path==='/internal/routes' && method==='GET') {
         const expected=process.env.GATEWAY_TOKEN;
         if(!expected || expected.length<32 || digest(req.headers.authorization||'')!==digest('Bearer '+expected)) fail(401,'Unauthorized');
+        if(!appRoutes) {res.json({http:{routers:{},services:{}}});return;}
         const {rows}=await db.query("SELECT * FROM containers WHERE status='RUNNING' AND expires_at>now() AND observed_at>now()-interval '45 seconds' AND upstream IS NOT NULL");
         const routers:Record<string,any>={},services:Record<string,any>={};
         for(const r of rows) {

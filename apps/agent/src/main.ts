@@ -16,7 +16,7 @@ const extraMonitorPaths=monitorPaths(process.env.MONITOR_DISK_PATHS_JSON);
 let dockerRoot:string|undefined;
 let nodeHealth={dockerAvailable:false,dockerVersion:null as string|null,checkedAt:0};
 let checkingHealth=false;
-const resourceMonitor=new ResourceMonitor(()=>['/',...(dockerRoot?[dockerRoot]:[]),...extraMonitorPaths]);
+const resourceMonitor=new ResourceMonitor(()=>['/',...(dockerRoot?[dockerRoot]:[]),...extraMonitorPaths],process.env.HOST_PROC_ROOT||'/proc');
 const secret=process.env.AGENT_SHARED_SECRET||'';
 if(secret.length<32)throw new Error('AGENT_SHARED_SECRET requires at least 32 characters');
 const images=JSON.parse(process.env.IMAGE_TEMPLATES_JSON||'{}') as Record<string,string>;
@@ -30,6 +30,7 @@ let diskQuota=temporaryQuota&&!process.env.NODE_ENV?.startsWith('production');
 if(process.env.NODE_ENV==='production' && volumeDriver==='local' && options.type==='tmpfs')throw new Error('tmpfs test volumes cannot provide production persistence');
 const bind=process.env.APP_BIND_IP||'127.0.0.1';
 const appHost=process.env.APP_UPSTREAM_HOST||'127.0.0.1';
+const internalHttp=process.env.INTERNAL_HTTP_ONLY==='true';
 if(!/^[a-zA-Z0-9.-]+$/.test(appHost))throw new Error('Invalid APP_UPSTREAM_HOST');
 const seen=new Map<string,number>();
 // Reject packets signed before this process started: no replay window after restart.
@@ -172,7 +173,8 @@ async function bootstrap() {
   const production=process.env.NODE_ENV==='production';
   const tls=process.env.AGENT_TLS_CERT_FILE && process.env.AGENT_TLS_KEY_FILE?
     {cert:readFileSync(process.env.AGENT_TLS_CERT_FILE),key:readFileSync(process.env.AGENT_TLS_KEY_FILE)}:undefined;
-  if(production&&!tls)throw new Error('Production Agent requires TLS certificate and key files');
+  if(production&&!tls&&!internalHttp)throw new Error('Production Agent requires TLS certificate and key files');
+  if(internalHttp&&bind!=='127.0.0.1'&&bind!=='::1')throw new Error('Internal HTTP Agent must bind to loopback');
   const app=await NestFactory.create(AgentModule,{rawBody:true,httpsOptions:tls});
   const wss=new WebSocketServer({noServer:true,maxPayload:65536});
   app.getHttpServer().on('upgrade',async(req:any,socket:any,head:any)=>{
