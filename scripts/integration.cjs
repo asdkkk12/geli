@@ -12,7 +12,7 @@ const fs=require('node:fs');
 const home=require('node:os').homedir();
 const secret=randomBytes(32).toString('hex'),gateway=randomBytes(32).toString('hex'),password=randomBytes(20).toString('hex');
 const suffix=Date.now().toString(36);
-const env={...process.env,NODE_ENV:'test',DATABASE_URL:process.env.TEST_DATABASE_URL||'postgresql://postgres@127.0.0.1:55432/geli_test',REDIS_URL:'redis://127.0.0.1:56379',PUBLIC_ORIGIN:'http://127.0.0.1:5173',APP_DOMAIN:'apps.example.test',PORT:'3300',AGENT_PORT:'3310',AGENT_SHARED_SECRET:secret,TEST_AGENT_SECRET:secret,GATEWAY_TOKEN:gateway,BOOTSTRAP_ADMIN_USERNAME:'admin-'+suffix,BOOTSTRAP_ADMIN_PASSWORD:password,IMAGE_TEMPLATES_JSON:JSON.stringify({test:'busybox:latest'}),SERVERS_JSON:JSON.stringify([{id:'test-server',url:'http://127.0.0.1:3310',secretEnv:'TEST_AGENT_SECRET',cpu:16,memoryMb:16384,diskGb:100}]),DOCKER_SOCKET:process.env.TEST_DOCKER_SOCKET||(fs.existsSync('/var/run/docker.sock')?'/var/run/docker.sock':path.join(home,'.docker/run/docker.sock')),VOLUME_DRIVER:'local',VOLUME_OPTIONS_JSON:JSON.stringify({type:'tmpfs',device:'tmpfs',o:'size={sizeGiB}g,uid=1000,gid=1000,mode=0700'})};
+const env={...process.env,NODE_ENV:'test',DATABASE_URL:process.env.TEST_DATABASE_URL||'postgresql://postgres@127.0.0.1:55432/geli_test',REDIS_URL:process.env.TEST_REDIS_URL||'redis://127.0.0.1:56379',PUBLIC_ORIGIN:'http://127.0.0.1:5173',APP_DOMAIN:'apps.example.test',PORT:'3300',AGENT_PORT:'3310',AGENT_SHARED_SECRET:secret,TEST_AGENT_SECRET:secret,GATEWAY_TOKEN:gateway,BOOTSTRAP_ADMIN_USERNAME:'admin-'+suffix,BOOTSTRAP_ADMIN_PASSWORD:password,IMAGE_TEMPLATES_JSON:JSON.stringify({test:'busybox:latest'}),SERVERS_JSON:JSON.stringify([{id:'test-server',url:'http://127.0.0.1:3310',secretEnv:'TEST_AGENT_SECRET',cpu:16,memoryMb:16384,diskGb:100}]),DOCKER_SOCKET:process.env.TEST_DOCKER_SOCKET||(fs.existsSync('/var/run/docker.sock')?'/var/run/docker.sock':path.join(home,'.docker/run/docker.sock')),VOLUME_DRIVER:'local',VOLUME_OPTIONS_JSON:JSON.stringify({type:'tmpfs',device:'tmpfs',o:'size={sizeGiB}g,uid=1000,gid=1000,mode=0700'})};
 const pool=new Pool({connectionString:env.DATABASE_URL});
 const docker=new Docker({socketPath:env.DOCKER_SOCKET});
 let api,agent,appId,gatewayContainer,logs='';
@@ -28,11 +28,13 @@ async function main(){
  await call('/api/containers',null,'GET',undefined,401);
  assert.equal((await fetch('http://127.0.0.1:3300/api/containers',{headers:{'x-user-id':'u-admin'}})).status,401);
  const a=await call('/api/auth/login',null,'POST',{username:env.BOOTSTRAP_ADMIN_USERNAME,password});
- const u1='user-'+suffix,u2='other-'+suffix;
+ const u1='user-'+suffix,u2='other-'+suffix,reviewerName='reviewer-'+suffix;
  await call('/api/users',a.token,'POST',{username:u1,password,role:'USER'});
  await call('/api/users',a.token,'POST',{username:u2,password,role:'USER'});
+ await call('/api/users',a.token,'POST',{username:reviewerName,password,role:'APPROVER'});
  const user=await call('/api/auth/login',null,'POST',{username:u1,password});
  const other=await call('/api/auth/login',null,'POST',{username:u2,password});
+ const reviewer=await call('/api/auth/login',null,'POST',{username:reviewerName,password});
  const spec={containerName:'integration-dev',purpose:'integration testing',imageTemplate:'test',cpu:1,memoryMb:256,diskGb:1,runtimeHours:1,internalPort:8080};
  await call('/api/container-applications',user.token,'POST',{...spec,privileged:true},400);
  const app=await call('/api/container-applications',user.token,'POST',spec,201);appId=app.id;
@@ -40,6 +42,14 @@ async function main(){
  await wait(async()=>{const s=await call('/api/servers',a.token);return s[0].online;});
  await call('/api/approvals/'+app.id+'/approve',a.token,'POST',{},202);
  await call('/api/approvals/'+app.id+'/approve',a.token,'POST',{},409);
+ await wait(async()=>{const c=await call('/api/containers',user.token);return c.find(c=>c.id===app.id&&c.status==='RUNNING');});
+ await call('/api/containers/'+app.id+'/restart',user.token,'POST',{},404);
+ await call('/api/containers/'+app.id,user.token,'DELETE',undefined,404);
+ await call('/api/management/containers',user.token,'GET',undefined,403);
+ assert.ok((await call('/api/management/containers',reviewer.token)).some(c=>c.id===app.id));
+ await call('/api/management/containers/'+app.id+'/stop',reviewer.token,'POST',{},202);
+ await wait(async()=>{const c=await call('/api/containers',user.token);return c.find(c=>c.id===app.id&&c.status==='STOPPED');});
+ await call('/api/management/containers/'+app.id+'/start',reviewer.token,'POST',{},202);
  await wait(async()=>{const c=await call('/api/containers',user.token);return c.find(c=>c.id===app.id&&c.status==='RUNNING');});
  await call('/api/containers/'+app.id+'/terminal-session',other.token,'POST',{},403);
  await call('/api/containers/'+app.id+'/logs',other.token,'GET',undefined,403);
@@ -67,9 +77,12 @@ async function main(){
  await call('/api/containers/'+app.id+'/stop',user.token,'POST',{},202);
  await wait(async()=>{const c=await call('/api/containers',user.token);return c.find(c=>c.id===app.id&&c.status==='STOPPED');});
  const stoppedRoutes=await(await fetch('http://127.0.0.1:3300/internal/routes',{headers:{authorization:'Bearer '+gateway}})).json();assert.equal(stoppedRoutes.http.routers['c-'+app.id],undefined);
+ await call('/api/management/containers/'+app.id,reviewer.token,'DELETE',undefined,202);
+ await wait(async()=>!(await call('/api/management/containers',reviewer.token)).some(c=>c.id===app.id));
+ await docker.getVolume('lab-'+app.id).inspect();
  await call('/api/auth/logout',user.token,'POST',{});await call('/api/containers',user.token,'GET',undefined,401);
- console.log('PASS: PostgreSQL persistence, Redis queue, login/logout, approval idempotency, owner isolation, real Docker, exec terminal, HTTP app, dynamic routes, HMAC replay rejection, restart recovery, stop and route withdrawal.');
- console.log('Retained test container: lab-'+app.id);
+ console.log('PASS: PostgreSQL persistence, Redis queue, login/logout, approval idempotency, owner and management permissions, real Docker, exec terminal, HTTP app, dynamic routes, HMAC replay rejection, restart recovery, stop and route withdrawal, retained volume.');
+ console.log('Retained test volume: lab-'+app.id);
 }
 main().catch(e=>{console.error(e);console.error(logs.slice(-5000));process.exitCode=1;}).finally(async()=>{
  await stop(api);await stop(agent);

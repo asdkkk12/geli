@@ -11,8 +11,10 @@ import Redis from 'ioredis';
 import { db, migrate, transaction, audit } from './store';
 import { specSchema, parse, token, digest, hashPassword, checkPassword, allowed } from './security';
 import { servers, agent, signed } from './agents';
+import { reservationQuery, ServerMonitor } from './monitoring';
 
 const redis = new Redis(process.env.REDIS_URL!, {maxRetriesPerRequest:null});
+const serverMonitor=new ServerMonitor(servers,{get:key=>redis.get(key),set:(key,value,mode,seconds)=>redis.set(key,value,mode,seconds)},id=>agent(id,'GET','/agent/resources',undefined,3000));
 const queue = new Queue('container-operations', {connection:redis as any});
 const origin = process.env.PUBLIC_ORIGIN!;
 const domain = process.env.APP_DOMAIN!;
@@ -33,15 +35,20 @@ async function containerFor(user:User,id:string) {
   const {rows}=await db.query('SELECT * FROM containers WHERE id=$1',[id]);
   if(!rows[0]) fail(404,'容器不存在'); allowed(user,rows[0].owner_id); return rows[0];
 }
+async function managedContainerFor(id:string) {
+  if (!z.string().uuid().safeParse(id).success) fail(404,'容器不存在');
+  const {rows}=await db.query('SELECT * FROM containers WHERE id=$1',[id]);
+  if(!rows[0]) fail(404,'容器不存在'); return rows[0];
+}
 function reviewer(user:User) { if(!['ADMIN','APPROVER'].includes(user.role)) fail(403,'需要审批权限'); }
 function admin(user:User) { if(user.role!=='ADMIN') fail(403,'需要管理员权限'); }
-async function operation(user:User,id:string,action:string) {
-  const container=await containerFor(user,id);
+async function operation(user:User,id:string,action:string,managed=false) {
+  const container=managed?await managedContainerFor(id):await containerFor(user,id);
   if(['start','restart'].includes(action) && new Date(container.expires_at).getTime()<=Date.now()) fail(409,'容器已到期');
   await transaction(async c=>{
     await c.query('SELECT id FROM containers WHERE id=$1 FOR UPDATE',[id]);
     await c.query('INSERT INTO tasks(id,container_id,action) VALUES($1,$2,$3)',[randomUUID(),id,action]);
-    await audit(user.id,'CONTAINER_'+action.toUpperCase(),id,{},c);
+    await audit(user.id,'CONTAINER_'+action.toUpperCase(),id,{managed},c);
   });
   return {queued:true};
 }
@@ -103,7 +110,7 @@ class ControllerImpl {
       }
       if(path==='/api/servers' && method==='GET') {
         reviewer(user);
-        res.json(await Promise.all(servers.map(async s=>({id:s.id,...JSON.parse(await redis.get('server:'+s.id)||'{"online":false}')}))));return;
+        res.json(await serverMonitor.list((await db.query(reservationQuery)).rows));return;
       }
       if(path==='/api/audit' && method==='GET') {admin(user);res.json((await db.query('SELECT * FROM audit ORDER BY id DESC LIMIT 500')).rows);return;}
       const retry=path.match(/^\/api\/tasks\/([a-f0-9-]{36})\/retry$/);
@@ -161,6 +168,16 @@ class ControllerImpl {
       if(path==='/api/containers' && method==='GET') {
         res.json((await db.query("SELECT * FROM containers WHERE ($1::boolean OR owner_id=$2) AND status!='DELETED' ORDER BY created_at DESC",[user.role==='ADMIN',user.id])).rows.map(serialize));return;
       }
+      if(path==='/api/management/containers' && method==='GET') {
+        reviewer(user);
+        res.json((await db.query("SELECT * FROM containers WHERE status!='DELETED' ORDER BY created_at DESC")).rows.map(serialize));return;
+      }
+      const management=path.match(/^\/api\/management\/containers\/([a-f0-9-]{36})(?:\/(start|stop|restart))?$/);
+      if(management) {
+        reviewer(user);const [,id,action]=management;
+        if(method==='POST'&&action) {res.status(202).json(await operation(user,id,action,true));return;}
+        if(method==='DELETE'&&!action) {res.status(202).json(await operation(user,id,'delete',true));return;}
+      }
       const match=path.match(/^\/api\/containers\/([a-f0-9-]{36})(?:\/(.*))?$/);
       if(match) {
         const [,id,action]=match; const container=await containerFor(user,id);
@@ -171,8 +188,7 @@ class ControllerImpl {
           await audit(user.id,'TERMINAL_TICKET',id);res.json({ticket});return;
         }
         if(method==='GET' && action==='logs') {res.json(await agent(container.server_id,'GET','/agent/containers/'+id+'/logs'));return;}
-        if(method==='POST' && ['start','stop','restart'].includes(action)) {res.status(202).json(await operation(user,id,action));return;}
-        if(method==='DELETE' && !action) {res.status(202).json(await operation(user,id,'delete'));return;}
+        if(method==='POST' && ['start','stop'].includes(action)) {res.status(202).json(await operation(user,id,action));return;}
       }
       fail(404,'接口不存在');
     } catch(e:any) {
@@ -212,10 +228,6 @@ let reconciling=false;
 async function reconcile() {
   if(reconciling)return; reconciling=true;
   try {
-    for(const s of servers) {
-      try {const h=await agent(s.id,'GET','/agent/resources');await redis.set('server:'+s.id,JSON.stringify({...h,online:true}),'EX',40);}
-      catch{await redis.set('server:'+s.id,JSON.stringify({online:false}),'EX',40);}
-    }
     // Transactional outbox: database commits survive Redis or process outages.
     const pending=(await db.query("SELECT id FROM tasks WHERE status IN ('PENDING','RUNNING')")).rows;
     for(const t of pending) await queue.add('operation',{id:t.id},{jobId:t.id,attempts:4,backoff:{type:'exponential',delay:2000},removeOnComplete:{count:1000},removeOnFail:{count:1000}});
@@ -230,6 +242,21 @@ async function reconcile() {
       } catch{/* Keep last state, but route leases expire after 45 seconds. */}
     }
   } finally{reconciling=false;}
+}
+async function backfillVolumeQuotas() {
+  const rows=(await db.query("SELECT id,server_id,spec FROM containers WHERE status!='DELETED'")).rows;
+  for(const row of rows) {
+    const diskGb=Number(row.spec?.diskGb);
+    if(!Number.isInteger(diskGb)||diskGb<1)continue;
+    try {
+      await agent(row.server_id,'POST','/agent/containers/'+row.id+'/quota',{diskGb},5000);
+      await db.query("UPDATE containers SET error=NULL WHERE id=$1 AND error LIKE '磁盘配额迁移失败：%'",[row.id]);
+    } catch(error:any) {
+      const message='磁盘配额迁移失败：'+error.message;
+      await db.query('UPDATE containers SET error=$2 WHERE id=$1',[row.id,message]);
+      console.error(message+' ('+row.id+')');
+    }
+  }
 }
 async function bootstrap() {
   if(!process.env.DATABASE_URL || !process.env.REDIS_URL) throw new Error('DATABASE_URL / REDIS_URL required');
@@ -286,10 +313,12 @@ async function bootstrap() {
   const worker=new Worker('container-operations',runTask,{connection:redis as any,concurrency:1});
   worker.on('error',e=>console.error(e.message));
   const timer=setInterval(()=>void reconcile().catch(e=>console.error(e.message)),10000);
+  serverMonitor.start();
   await app.listen(Number(process.env.PORT||3000),process.env.BIND_ADDRESS||'127.0.0.1');
   await reconcile();
+  await backfillVolumeQuotas();
   for(const signal of ['SIGTERM','SIGINT']) process.once(signal,async()=>{
-    clearInterval(timer);for(const ws of wss.clients)ws.close();await worker.close();await queue.close();await redis.quit();await db.end();await app.close();process.exit(0);
+    clearInterval(timer);await serverMonitor.stop();for(const ws of wss.clients)ws.close();await worker.close();await queue.close();await redis.quit();await db.end();await app.close();process.exit(0);
   });
 }
 bootstrap().catch(e=>{console.error(e.message);process.exit(1);});

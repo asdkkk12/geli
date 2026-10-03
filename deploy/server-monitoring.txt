@@ -1,0 +1,30 @@
+首台计算节点部署与监控
+
+硬件基线：2× Intel Xeon Gold 6530（共 64 物理核心）、128 GiB 内存、3.84 TB U.2 NVMe 数据盘。
+容器调度预算：56 CPU 核、114688 MiB 内存、3277 GiB 磁盘；保留 8 核、16 GiB 及磁盘余量给宿主机、Docker、日志和维护。
+
+1. 将 U.2 数据盘格式化为 XFS，并以 `prjquota` 挂载至 `/srv/lab-docker`。挂载必须由 `/etc/fstab` 的 UUID 固化，例如：`UUID=<uuid> /srv/lab-docker xfs defaults,prjquota 0 0`；重启后确认 `xfs_quota -x -c state /srv/lab-docker` 的 Project quota state 为 ON。
+2. 在停止 Docker 后，将 Docker 数据根迁移到该挂载点；使用 deploy/docker-daemon.u2-data-root.json.example 作为 /etc/docker/daemon.json 的 data-root 配置参考。迁移前备份现有 Docker 数据，生产切换由维护管理员执行。
+3. 安装 `deploy/geli-quota-helper.cjs` 至 `/opt/geli/deploy/`，文件属主为 root 且权限为 0700；安装并启用 `deploy/geli-quota-helper.service.example`。助手 Socket 的组为 `lab-agent`，只允许平台管理的 `lab-<uuid>` Volume 目录设置 XFS 项目配额。
+4. Agent 环境配置 `VOLUME_DRIVER=local`、`VOLUME_OPTIONS_JSON={}`、`QUOTA_HELPER_SOCKET=/run/geli-quota-helper.sock`、`QUOTA_VOLUME_ROOT=/srv/lab-docker/volumes`。生产环境不可使用 tmpfs 卷；助手不可用时节点 `diskQuota=false`，审批不会调度到该节点。
+5. Agent 服务账号必须可读取 /proc、Docker Socket、Docker data-root 和配额助手 Socket。可选 MONITOR_DISK_PATHS_JSON 是额外绝对路径数组；本节点默认仅监控 / 与 Docker data-root。
+6. 管理端 SERVERS_JSON 添加节点，例如：
+   [{"id":"lab-server-01","url":"https://agent-01.example.edu:3100","secretEnv":"AGENT_01_SECRET","cpu":56,"memoryMb":114688,"diskGb":3277}]
+   Agent 地址、密钥变量名和 TLS 证书路径必须替换为真实管理网配置，不要提交密钥。
+
+权限、配额迁移与验收
+
+- 申请人仅能启动、停止自己的容器，仍可进入终端和查看日志。审批员与管理员在“容器管理”页可启动、停止、重启、删除所有容器；删除仅删除容器和网络，保留数据 Volume。
+- API 启动时会为所有未删除容器的已有 Volume 补设与 `diskGb` 一致的项目硬配额。若已有数据超额，助手拒绝配额设置，API 将容器错误标记为“磁盘配额迁移失败”，不会截断数据；管理员清理数据后重启 API 或重新创建容器即可重试。
+- 新建容器会先创建 Docker Volume，再由助手设置硬配额，成功后才启动容器。执行 `dd if=/dev/zero of=/home/developer/limit-test bs=1M count=<diskGiB*1024+1>`，写入应失败。
+
+监控运行方式
+
+- Agent 每 5 秒从 /proc/stat、/proc/meminfo 和 statfs 采样；CPU 首轮显示采集中，内存以 MemAvailable 为可用量。
+- API 每 5 秒并发拉取 Agent，3 秒超时；server:<id> 健康缓存保留 40 秒，server:metrics:<id> 有效快照保留 60 秒。
+- 管理端只在审批/管理员打开服务器页且页面可见时轮询。OK、PARTIAL、UNREACHABLE、STALE、INITIALIZING 分别表示正常、部分失败、Agent 不可达、数据过期和等待首次采集。
+- 审批额度使用未删除容器的已预留资源统计；它不等同于物理瞬时空闲量。删除容器后保留的数据卷仍占实际磁盘。
+
+监控验收
+
+在 Linux 节点上对照：top、free -h、df -h "$(docker info -f '{{.DockerRootDir}}')"。确认管理端路径为 /srv/lab-docker，执行一次超过申请容量的写入，验证 XFS 项目配额拒绝写入。随后运行 npm run build 与 npm test。

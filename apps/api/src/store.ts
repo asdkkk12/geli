@@ -27,6 +27,8 @@ export async function migrate() {
       CREATE TABLE IF NOT EXISTS audit (
         id BIGSERIAL PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL,
         resource TEXT NOT NULL, detail JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+      ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+      ALTER TABLE users ADD CONSTRAINT users_role_check CHECK(role IN ('USER','APPROVER','ADMIN'));
     `);
   });
 }

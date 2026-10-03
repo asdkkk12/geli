@@ -1,0 +1,19 @@
+[Unit]
+Description=Geli XFS project quota helper
+After=local-fs.target docker.service
+RequiresMountsFor=/srv/lab-docker
+
+[Service]
+Type=simple
+User=root
+Group=lab-agent
+Environment=GELI_QUOTA_SOCKET=/run/geli-quota-helper.sock
+Environment=GELI_QUOTA_ROOT=/srv/lab-docker/volumes
+Environment=GELI_QUOTA_STATE=/var/lib/geli-quota/projects.json
+ExecStart=/usr/bin/node /opt/geli/deploy/geli-quota-helper.cjs
+Restart=on-failure
+RuntimeDirectory=geli-quota-helper
+UMask=007
+
+[Install]
+WantedBy=multi-user.target

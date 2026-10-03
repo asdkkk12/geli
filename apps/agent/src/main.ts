@@ -5,18 +5,28 @@ import { Request, Response } from 'express';
 import Docker from 'dockerode';
 import { WebSocketServer, WebSocket } from 'ws';
 import { z } from 'zod';
-import { cpus, freemem, totalmem } from 'node:os';
+import { cpus } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { createSchema, hostConfig, verifySignature } from './policy';
+import { monitorPaths, ResourceMonitor } from './resources';
+import { QuotaClient } from './quota';
 const docker=new Docker({socketPath:process.env.DOCKER_SOCKET||'/var/run/docker.sock'});
+const monitoringDocker=new Docker({socketPath:process.env.DOCKER_SOCKET||'/var/run/docker.sock',timeout:2500});
+const extraMonitorPaths=monitorPaths(process.env.MONITOR_DISK_PATHS_JSON);
+let dockerRoot:string|undefined;
+let nodeHealth={dockerAvailable:false,dockerVersion:null as string|null,checkedAt:0};
+let checkingHealth=false;
+const resourceMonitor=new ResourceMonitor(()=>['/',...(dockerRoot?[dockerRoot]:[]),...extraMonitorPaths]);
 const secret=process.env.AGENT_SHARED_SECRET||'';
 if(secret.length<32)throw new Error('AGENT_SHARED_SECRET requires at least 32 characters');
 const images=JSON.parse(process.env.IMAGE_TEMPLATES_JSON||'{}') as Record<string,string>;
 if(!Object.keys(images).length)throw new Error('IMAGE_TEMPLATES_JSON required');
 const label='lab.platform';
 const volumeDriver=process.env.VOLUME_DRIVER;
-const diskQuota=!!volumeDriver && !!process.env.VOLUME_OPTIONS_JSON;
 const options=JSON.parse(process.env.VOLUME_OPTIONS_JSON||'{}') as Record<string,string>;
+const quotaClient=new QuotaClient(process.env.QUOTA_HELPER_SOCKET,process.env.QUOTA_VOLUME_ROOT);
+const temporaryQuota=volumeDriver==='local'&&options.type==='tmpfs';
+let diskQuota=temporaryQuota&&!process.env.NODE_ENV?.startsWith('production');
 if(process.env.NODE_ENV==='production' && volumeDriver==='local' && options.type==='tmpfs')throw new Error('tmpfs test volumes cannot provide production persistence');
 const bind=process.env.APP_BIND_IP||'127.0.0.1';
 const appHost=process.env.APP_UPSTREAM_HOST||'127.0.0.1';
@@ -33,6 +43,23 @@ function auth(req:any,body='') {
 function name(id:string) {
   if(!z.string().uuid().safeParse(id).success)throw Object.assign(new Error('Invalid ID'),{status:400});
   return 'lab-'+id;
+}
+async function refreshNodeHealth() {
+  if(checkingHealth)return;checkingHealth=true;
+  try {
+    const info=await monitoringDocker.info().catch(()=>null);
+    if(info?.DockerRootDir)dockerRoot=info.DockerRootDir;
+    nodeHealth={dockerAvailable:!!info,dockerVersion:info?.ServerVersion??null,checkedAt:Date.now()};
+    if(quotaClient.enabled)diskQuota=await quotaClient.health();
+  } finally {checkingHealth=false;}
+}
+async function ensureQuota(id:string,diskGb:number) {
+  if(!volumeDriver)throw Object.assign(new Error('Volume driver not configured'),{status:409});
+  if(temporaryQuota&&!quotaClient.enabled)return;
+  if(!quotaClient.available&&!await quotaClient.health())throw Object.assign(new Error('XFS quota helper unavailable'),{status:409});
+  const volume=await docker.getVolume(name(id)).inspect();
+  if(volume.Labels?.[label]!==id)throw Object.assign(new Error('Volume ownership mismatch'),{status:403});
+  await quotaClient.ensure(name(id),volume.Mountpoint,diskGb*1024*1024*1024);
 }
 async function managed(id:string) {
   const c=docker.getContainer(name(id)), info=await c.inspect();
@@ -71,6 +98,7 @@ async function create(input:unknown) {
       const opts=Object.fromEntries(Object.entries(options).map(([k,v])=>[k,v.replaceAll('{sizeGiB}',String(b.diskGb))]));
       await docker.createVolume({Name:resource,Driver:volumeDriver,DriverOpts:opts,Labels:{[label]:b.id}});
     }
+    await ensureQuota(b.id,b.diskGb);
     const network=await docker.getNetwork(resource).inspect();
     if(network.Labels?.[label]!==b.id)throw new Error('Network ownership mismatch');
     let c:Docker.Container;
@@ -112,10 +140,15 @@ class AgentController {
     try {
       auth(req,(req as any).rawBody?.toString()||'');
       if(req.path==='/agent/resources'&&req.method==='GET') {
-        const info=await docker.info();
-        res.json({cpuTotal:info.NCPU||cpus().length,memoryMbTotal:Math.floor(totalmem()/1048576),memoryMbAvailable:Math.floor(freemem()/1048576),dockerVersion:info.ServerVersion,diskQuota});return;
+        const metrics=resourceMonitor.snapshot,healthFresh=Date.now()-nodeHealth.checkedAt<=15000;
+        res.json({cpuTotal:cpus().length,memoryMbTotal:metrics.memory.value?Math.floor(metrics.memory.value.totalBytes/1048576):null,memoryMbAvailable:metrics.memory.value?Math.floor(metrics.memory.value.availableBytes/1048576):null,dockerVersion:nodeHealth.dockerVersion,dockerAvailable:healthFresh&&nodeHealth.dockerAvailable,dockerRoot:dockerRoot??null,diskQuota,metrics});return;
       }
       if(req.path==='/agent/containers'&&req.method==='POST'){res.json(await create(req.body));return;}
+      const quota=req.path.match(/^\/agent\/containers\/([a-f0-9-]{36})\/quota$/);
+      if(quota&&req.method==='POST') {
+        const body=z.object({diskGb:z.number().int().min(1).max(2000)}).strict().parse(req.body);
+        await ensureQuota(quota[1],body.diskGb);res.json({ok:true});return;
+      }
       const m=req.path.match(/^\/agent\/containers\/([a-f0-9-]{36})(?:\/(start|stop|restart|delete|logs))?$/);
       if(m) {
         const [,id,op]=m;
@@ -181,7 +214,10 @@ async function bootstrap() {
       for(const c of list)if(new Date(c.Labels['lab.expires']).getTime()<=Date.now())await action(c.Labels[label],'stop');
     }catch(e:any){console.error(e.message);}
   },10000);
+  resourceMonitor.start();
+  const refreshHealth=()=>void refreshNodeHealth().catch(error=>console.error('Node health check failed:',error.message));
+  refreshHealth();const healthTimer=setInterval(refreshHealth,5000);
   await app.listen(Number(process.env.AGENT_PORT||3100),process.env.AGENT_BIND_ADDRESS||'127.0.0.1');
-  for(const signal of ['SIGTERM','SIGINT'])process.once(signal,async()=>{clearInterval(timer);for(const ws of wss.clients)ws.close();await app.close();process.exit(0);});
+  for(const signal of ['SIGTERM','SIGINT'])process.once(signal,async()=>{clearInterval(timer);clearInterval(healthTimer);resourceMonitor.stop();for(const ws of wss.clients)ws.close();await app.close();process.exit(0);});
 }
 bootstrap().catch(e=>{console.error(e.message);process.exit(1);});

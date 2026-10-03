@@ -12,9 +12,9 @@ export function signed(serverId:string, method:string, path:string, body='') {
   const signature=createHmac('sha256',process.env[server.secretEnv]!).update([method,path,time,nonce,body].join('\n')).digest('hex');
   return {server, headers:{'content-type':'application/json','x-time':time,'x-nonce':nonce,'x-signature':signature}};
 }
-export async function agent(serverId:string, method:string, path:string, payload?:unknown) {
+export async function agent(serverId:string, method:string, path:string, payload?:unknown, timeoutMs=30000) {
   const body=payload===undefined?'':JSON.stringify(payload); const {server,headers}=signed(serverId,method,path,body);
-  const response=await fetch(server.url+path,{method,headers,body:body||undefined,signal:AbortSignal.timeout(30000)});
+  const response=await fetch(server.url+path,{method,headers,body:body||undefined,signal:AbortSignal.timeout(timeoutMs)});
   if (!response.ok) throw new Error(`Agent ${serverId}: HTTP ${response.status}`);
   return response.json() as Promise<any>;
 }

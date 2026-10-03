@@ -1,6 +1,7 @@
 [Unit]
 Description=Lab Docker Agent
-After=network-online.target docker.service
+After=network-online.target docker.service geli-quota-helper.service
+Requires=geli-quota-helper.service
 [Service]
 User=lab-agent
 SupplementaryGroups=docker

@@ -14,6 +14,7 @@
     "build": "npm run build --workspaces",
     "test": "npm run test --workspaces",
     "test:integration": "node scripts/integration.cjs",
+    "test:monitoring": "node --test apps/api/test/monitoring.test.cjs apps/agent/test/resources.test.cjs",
     "demo": "node scripts/demo.cjs start",
     "demo:stop": "node scripts/demo.cjs stop",
     "demo:status": "node scripts/demo.cjs status"
